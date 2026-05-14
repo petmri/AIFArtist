@@ -1,0 +1,6 @@
+napari
+nibabel
+numpy
+pandas
+matplotlib
+PySide6
