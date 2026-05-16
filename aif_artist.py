@@ -36,6 +36,7 @@ from qtpy.QtWidgets import (
 
 
 SOURCE_IMAGE_SUFFIXES = ("desc-hmc_DCE.nii", "desc-hmc_DCE.nii.gz")
+MASK_LABEL_VARIANTS = ("AIF", "aif")
 DEFAULT_2D_ORDER = (1, 2, 0)
 
 
@@ -141,6 +142,18 @@ def aifartist_mouse_wheel(viewer: napari.Viewer, event) -> None:
             )
             viewer.dims._scroll_progress -= step_offset
         event.handled = True
+        return
+
+    if viewer.dims.ndisplay == 3 and "Shift" in event.modifiers and "Control" not in event.modifiers and "Alt" not in event.modifiers:
+        if widget is not None:
+            widget.adjust_window_limit_from_scroll("high", signed_delta)
+            event.handled = True
+        return
+
+    if viewer.dims.ndisplay == 3 and "Alt" in event.modifiers and "Control" not in event.modifiers and "Shift" not in event.modifiers:
+        if widget is not None:
+            widget.adjust_window_limit_from_scroll("low", signed_delta)
+            event.handled = True
         return
 
     if viewer.dims.ndisplay in (2, 3) and "Control" in event.modifiers and "Shift" not in event.modifiers:
@@ -307,7 +320,11 @@ class AIFArtistWidget(QWidget):
             self.current_index = 0
             return
         for index in range(max(requested_index, 0), len(self.records)):
-            if not self.mask_path_for(self.records[index]).exists():
+            if not existing_mask_path_for_record(
+                self.output_root,
+                self.records[index],
+                self.rater_name,
+            ).exists():
                 self.current_index = index
                 return
         self.current_index = min(max(requested_index, 0), len(self.records) - 1)
@@ -380,6 +397,26 @@ class AIFArtistWidget(QWidget):
             self.frame_slider.setValue(clamped_index)
             return
         self.image_layer.data = self.current_data[..., clamped_index]
+
+    def adjust_window_limit_from_scroll(self, bound: str, signed_delta: float) -> None:
+        if self.image_layer is None:
+            return
+
+        low_value, high_value = (float(value) for value in self.image_layer.contrast_limits)
+        control_lower, control_upper = self.current_window_control_range
+        step_size = max(self.window_high_spinbox.singleStep(), 0.001)
+        minimum_gap = step_size
+        delta_step = -signed_delta * step_size
+
+        if bound == "high":
+            high_value = float(np.clip(high_value + delta_step, low_value + minimum_gap, control_upper))
+        elif bound == "low":
+            low_value = float(np.clip(low_value + delta_step, control_lower, high_value - minimum_gap))
+        else:
+            raise ValueError(f"Unsupported window bound: {bound}")
+
+        self.image_layer.contrast_limits = (low_value, high_value)
+        self._set_window_level_controls(low_value, high_value)
 
     def _configure_window_level_controls(self, bounds: tuple[float, float]) -> None:
         lower_bound, upper_bound = bounds
@@ -569,6 +606,11 @@ class AIFArtistWidget(QWidget):
             data[..., default_frame],
             self.current_intensity_bounds,
         )
+        preserved_limits = auto_limits
+        if self.image_layer is not None:
+            current_limits = tuple(float(value) for value in self.image_layer.contrast_limits)
+            if len(current_limits) == 2 and np.all(np.isfinite(current_limits)) and current_limits[0] < current_limits[1]:
+                preserved_limits = current_limits
         self.frame_slider.blockSignals(True)
         self.frame_spinbox.blockSignals(True)
         self.frame_slider.setMaximum(frame_count - 1)
@@ -586,15 +628,19 @@ class AIFArtistWidget(QWidget):
                 rendering="mip",
                 depiction="volume",
                 scale=self.current_spacing,
-                contrast_limits=auto_limits,
+                contrast_limits=preserved_limits,
             )
         else:
             self.image_layer.data = data[..., default_frame]
             self.image_layer.scale = self.current_spacing
-            self.image_layer.contrast_limits = auto_limits
+            self.image_layer.contrast_limits = preserved_limits
 
-        self._configure_window_level_controls(self.current_intensity_bounds)
-        self._set_window_level_controls(*auto_limits)
+        control_bounds = (
+            min(self.current_intensity_bounds[0], preserved_limits[0]),
+            max(self.current_intensity_bounds[1], preserved_limits[1]),
+        )
+        self._configure_window_level_controls(control_bounds)
+        self._set_window_level_controls(*preserved_limits)
 
         if self.labels_layer is None:
             self.labels_layer = self.viewer.add_labels(
@@ -629,7 +675,11 @@ class AIFArtistWidget(QWidget):
     def _load_existing_mask(self) -> None:
         if self.labels_layer is None or self.current_record is None:
             return
-        mask_path = self.mask_path_for(self.current_record)
+        mask_path = existing_mask_path_for_record(
+            self.output_root,
+            self.current_record,
+            self.rater_name,
+        )
         if not mask_path.exists():
             self._set_status("Loaded image.")
             return
@@ -761,7 +811,7 @@ class AIFArtistWidget(QWidget):
         return path / "dce"
 
     def output_stem_for(self, record: ImageRecord) -> str:
-        parts = [record.entity_stem, f"desc-rater{self.rater_name}", "label-aif"]
+        parts = [record.entity_stem, f"desc-rater{self.rater_name}", "label-AIF"]
         return "_".join(parts)
 
     def mask_path_for(self, record: ImageRecord) -> Path:
@@ -942,12 +992,29 @@ def output_directory_for(output_root: Path, record: ImageRecord) -> Path:
 
 
 def output_stem_for(record: ImageRecord, rater_name: str) -> str:
-    parts = [record.entity_stem, f"desc-rater{sanitize_label(rater_name)}", "label-aif"]
+    parts = [record.entity_stem, f"desc-rater{sanitize_label(rater_name)}", "label-AIF"]
     return "_".join(parts)
 
 
 def mask_path_for_record(output_root: Path, record: ImageRecord, rater_name: str) -> Path:
     return output_directory_for(output_root, record) / f"{output_stem_for(record, rater_name)}_mask.nii.gz"
+
+
+def mask_path_variants_for_record(output_root: Path, record: ImageRecord, rater_name: str) -> tuple[Path, ...]:
+    output_directory = output_directory_for(output_root, record)
+    sanitized_rater = sanitize_label(rater_name)
+    return tuple(
+        output_directory
+        / f"{'_'.join((record.entity_stem, f'desc-rater{sanitized_rater}', f'label-{label_variant}'))}_mask.nii.gz"
+        for label_variant in MASK_LABEL_VARIANTS
+    )
+
+
+def existing_mask_path_for_record(output_root: Path, record: ImageRecord, rater_name: str) -> Path:
+    for mask_path in mask_path_variants_for_record(output_root, record, rater_name):
+        if mask_path.exists():
+            return mask_path
+    return mask_path_for_record(output_root, record, rater_name)
 
 
 def filter_completed_records(
@@ -961,7 +1028,7 @@ def filter_completed_records(
     return [
         record
         for record in records
-        if not mask_path_for_record(output_root, record, rater_name).exists()
+        if not existing_mask_path_for_record(output_root, record, rater_name).exists()
     ]
 
 

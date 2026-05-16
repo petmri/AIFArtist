@@ -56,4 +56,4 @@ The derivative root also gets a `dataset_description.json` file.
 - The app opens at the first remaining queue item unless `--include-completed` is provided, in which case `--start-index` applies directly to the full queue.
 - If a saved ROI already exists for that rater and image, it is loaded automatically for editing.
 - The queue discovery step filters down to 4D `desc-hmc_DCE.nii` and `desc-hmc_DCE.nii.gz` images anywhere under the provided inputs, including derivative datasets.
-- In both 2D and 3D views, use `Ctrl+scroll` to step through time frames. Use `Shift+Ctrl+scroll` to zoom. In 2D view, plain scroll still steps through slices.
+- In both 2D and 3D views, use `Ctrl+scroll` to step through time frames. In 3D view, use `Shift+scroll` to adjust the upper window limit, `Alt+scroll` to adjust the lower window limit, and `Shift+Ctrl+scroll` to zoom. In 2D view, plain scroll still steps through slices.
