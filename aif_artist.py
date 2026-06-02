@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from napari.layers import Image, Labels
 from qtpy.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -37,7 +39,9 @@ from qtpy.QtWidgets import (
 
 SOURCE_IMAGE_SUFFIXES = ("desc-hmc_DCE.nii", "desc-hmc_DCE.nii.gz")
 MASK_LABEL_VARIANTS = ("AIF", "aif")
+FLAG_REASON_OPTIONS = ("Poor AIF", "Missing baseline")
 DEFAULT_2D_ORDER = (1, 2, 0)
+DEFAULT_OUTPUT_ROOT = Path("/media/network_mriphysics/dce_bids/derivatives/AIFArtist")
 
 
 def normalize_2d_order(order: Sequence[int]) -> tuple[int, int, int]:
@@ -45,6 +49,24 @@ def normalize_2d_order(order: Sequence[int]) -> tuple[int, int, int]:
     if len(normalized) == 3 and sorted(normalized) == [0, 1, 2]:
         return normalized
     return DEFAULT_2D_ORDER
+
+
+def event_modifier_flags(event) -> set[str]:
+    flags: set[str] = set()
+    for modifier in getattr(event, "modifiers", ()) or ():
+        for candidate in (modifier, getattr(modifier, "name", None)):
+            if candidate is None:
+                continue
+            text = str(candidate).casefold()
+            if "control" in text or "ctrl" in text:
+                flags.add("control")
+            if "shift" in text:
+                flags.add("shift")
+            if "alt" in text or "option" in text:
+                flags.add("alt")
+            if "meta" in text or "super" in text or "command" in text or text == "cmd":
+                flags.add("meta")
+    return flags
 
 
 @dataclass(slots=True)
@@ -70,6 +92,20 @@ class SaveRequest:
     mask_path: Path
     tsv_path: Path
     json_path: Path
+    write_sidecars: bool = False
+
+
+@dataclass(slots=True)
+class LoadedRecord:
+    record: ImageRecord
+    source_image: nib.Nifti1Image
+    data: np.ndarray
+    spacing: tuple[float, float, float]
+    intensity_bounds: tuple[float, float]
+    source_to_display: np.ndarray
+    display_to_source: np.ndarray
+    default_frame: int
+    existing_mask: np.ndarray | None
 
 
 class SaveTaskSignals(QObject):
@@ -92,42 +128,144 @@ class SaveTask(QRunnable):
         self.signals.finished.emit(self.request.record_stem)
 
 
+class LoadTaskSignals(QObject):
+    finished = Signal(int, int, object)
+    failed = Signal(int, int, str, str)
+
+
+class LoadTask(QRunnable):
+    def __init__(
+        self,
+        request_id: int,
+        index: int,
+        record: ImageRecord,
+        output_root: Path,
+        rater_name: str,
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.index = index
+        self.record = record
+        self.output_root = output_root
+        self.rater_name = rater_name
+        self.signals = LoadTaskSignals()
+
+    def run(self) -> None:
+        try:
+            loaded_record = prepare_record_for_display(
+                self.record,
+                self.output_root,
+                self.rater_name,
+            )
+        except Exception as exc:  # pragma: no cover - exercised through runtime worker path
+            self.signals.failed.emit(
+                self.request_id,
+                self.index,
+                self.record.image_path.name,
+                str(exc),
+            )
+            return
+        self.signals.finished.emit(self.request_id, self.index, loaded_record)
+
+
 class CurveCanvas(FigureCanvasQTAgg):
-    def __init__(self) -> None:
+    def __init__(self, title: str = "ROI Signal Intensity", y_label: str = "Mean intensity") -> None:
         figure = Figure(figsize=(5, 3), tight_layout=True)
         self.axes = figure.add_subplot(111)
         super().__init__(figure)
-        self.axes.set_title("ROI Signal Intensity")
+        self.title = title
+        self.y_label = y_label
+        self.axes.set_title(self.title)
         self.axes.set_xlabel("Timepoint")
-        self.axes.set_ylabel("Mean intensity")
+        self.axes.set_ylabel(self.y_label)
         self.axes.grid(True, alpha=0.3)
 
-    def update_curve(self, curve: np.ndarray | None) -> None:
+    def update_curve(
+        self,
+        curves: dict[int, np.ndarray] | None,
+        curve_colors: dict[int, tuple[float, float, float, float]] | None = None,
+        empty_message: str = "Paint an AIF ROI to preview the mean time curve.",
+    ) -> None:
         self.axes.clear()
-        self.axes.set_title("ROI Signal Intensity")
+        self.axes.set_title(self.title)
         self.axes.set_xlabel("Timepoint")
-        self.axes.set_ylabel("Mean intensity")
+        self.axes.set_ylabel(self.y_label)
         self.axes.grid(True, alpha=0.3)
-        if curve is None or curve.size == 0:
+        if not curves:
             self.axes.text(
                 0.5,
                 0.5,
-                "Paint an AIF ROI to preview the mean time curve.",
+                empty_message,
                 ha="center",
                 va="center",
                 transform=self.axes.transAxes,
             )
         else:
-            self.axes.plot(np.arange(curve.size), curve, linewidth=2, color="#166534")
-            self.axes.scatter(np.arange(curve.size), curve, s=18, color="#166534")
+            for label_value, curve in sorted(curves.items()):
+                color = None if curve_colors is None else curve_colors.get(label_value)
+                timepoints = np.arange(curve.size)
+                self.axes.plot(
+                    timepoints,
+                    curve,
+                    linewidth=2,
+                    color=color,
+                    label=f"Label {label_value}",
+                )
+                self.axes.scatter(timepoints, curve, s=18, color=color)
+            if len(curves) > 1:
+                self.axes.legend(loc="best")
         self.draw_idle()
+
+
+def prepare_record_for_display(
+    record: ImageRecord,
+    output_root: Path,
+    rater_name: str,
+) -> LoadedRecord:
+    source_nifti = nib.load(str(record.image_path))
+    display_nifti = nib.as_closest_canonical(source_nifti)
+    data = np.asarray(display_nifti.get_fdata(dtype=np.float32), dtype=np.float32)
+    if data.ndim != 4:
+        raise ValueError(f"Expected 4D image for {record.image_path.name}, got shape {data.shape}.")
+
+    spacing = extract_spatial_scale(display_nifti)
+    intensity_bounds = compute_intensity_bounds(data)
+    source_ornt = io_orientation(source_nifti.affine)
+    display_ornt = io_orientation(display_nifti.affine)
+    source_to_display = ornt_transform(source_ornt, display_ornt)
+    display_to_source = ornt_transform(display_ornt, source_ornt)
+    default_frame = infer_max_increase_frame(data)
+
+    existing_mask = None
+    mask_path = existing_mask_path_for_record(output_root, record, rater_name)
+    if mask_path.exists():
+        mask = np.asarray(nib.load(str(mask_path)).get_fdata(), dtype=np.uint8)
+        mask = reorient_spatial_array(mask, source_to_display)
+        if mask.shape != data.shape[:3]:
+            raise ValueError(
+                f"Existing ROI shape {mask.shape} does not match image shape {data.shape[:3]}."
+            )
+        existing_mask = np.asarray(mask, dtype=np.uint8)
+
+    return LoadedRecord(
+        record=record,
+        source_image=source_nifti,
+        data=data,
+        spacing=spacing,
+        intensity_bounds=intensity_bounds,
+        source_to_display=source_to_display,
+        display_to_source=display_to_source,
+        default_frame=default_frame,
+        existing_mask=existing_mask,
+    )
 
 
 def aifartist_mouse_wheel(viewer: napari.Viewer, event) -> None:
     signed_delta = float(event.delta[1]) if event.native.inverted() else -float(event.delta[1])
     widget = getattr(viewer, "_aifartist_widget", None)
+    modifier_flags = event_modifier_flags(event)
 
-    if viewer.dims.ndisplay == 2 and "Control" not in event.modifiers:
+    if viewer.dims.ndisplay == 2 and "control" not in modifier_flags:
         hidden_axes = viewer.dims.not_displayed
         if not hidden_axes:
             return
@@ -144,27 +282,52 @@ def aifartist_mouse_wheel(viewer: napari.Viewer, event) -> None:
         event.handled = True
         return
 
-    if viewer.dims.ndisplay == 3 and "Shift" in event.modifiers and "Control" not in event.modifiers and "Alt" not in event.modifiers:
+    if viewer.dims.ndisplay == 3 and "shift" in modifier_flags and "control" not in modifier_flags and "alt" not in modifier_flags:
         if widget is not None:
             widget.adjust_window_limit_from_scroll("high", signed_delta)
             event.handled = True
         return
 
-    if viewer.dims.ndisplay == 3 and "Alt" in event.modifiers and "Control" not in event.modifiers and "Shift" not in event.modifiers:
+    if viewer.dims.ndisplay == 3 and "alt" in modifier_flags and "control" not in modifier_flags and "shift" not in modifier_flags:
         if widget is not None:
             widget.adjust_window_limit_from_scroll("low", signed_delta)
             event.handled = True
         return
 
-    if viewer.dims.ndisplay in (2, 3) and "Control" in event.modifiers and "Shift" not in event.modifiers:
+    if viewer.dims.ndisplay in (2, 3) and "control" in modifier_flags and "shift" not in modifier_flags and "alt" not in modifier_flags:
         if widget is not None:
             widget.step_frame_from_scroll(signed_delta)
             event.handled = True
         return
 
-    if "Control" in event.modifiers and "Shift" in event.modifiers:
+    if "control" in modifier_flags and "shift" in modifier_flags:
         viewer.camera.zoom *= 1.1 ** signed_delta
         event.handled = True
+
+
+def aifartist_right_click_erase(viewer: napari.Viewer, event):
+    widget = getattr(viewer, "_aifartist_widget", None)
+    if widget is None or widget.labels_layer is None:
+        return
+    if viewer.dims.ndisplay != 2 or event.button != 2 or event.modifiers:
+        return
+    if viewer.layers.selection.active is not widget.labels_layer:
+        return
+
+    previous_mode = widget.labels_layer.mode
+    widget.labels_layer.mode = "erase"
+    event.handled = True
+    yield
+
+    while event.type == "mouse_move":
+        event.handled = True
+        yield
+
+    if widget.labels_layer is not None:
+        if viewer.dims.ndisplay == 2:
+            widget.labels_layer.mode = previous_mode
+        else:
+            widget._sync_roi_interaction_mode()
 
 
 class AIFArtistWidget(QWidget):
@@ -176,6 +339,7 @@ class AIFArtistWidget(QWidget):
         rater_name: str,
         start_index: int = 0,
         include_completed: bool = False,
+        write_sidecars: bool = False,
     ) -> None:
         super().__init__()
         self.viewer = viewer
@@ -183,6 +347,7 @@ class AIFArtistWidget(QWidget):
         self.output_root = output_root
         self.rater_name = sanitize_label(rater_name)
         self.include_completed = include_completed
+        self.write_sidecars = write_sidecars
         self.current_index = min(max(start_index, 0), max(len(self.records) - 1, 0))
         self.current_record: ImageRecord | None = None
         self.current_image: nib.Nifti1Image | None = None
@@ -200,6 +365,11 @@ class AIFArtistWidget(QWidget):
         self.image_layer: Image | None = None
         self.labels_layer: Labels | None = None
         self._updating_window_controls = False
+        self._record_load_request_id = 0
+        self._record_load_in_progress = False
+        self._prefetch_request_id = 0
+        self._prefetched_index: int | None = None
+        self._prefetched_record: LoadedRecord | None = None
         self.save_thread_pool = QThreadPool(self)
         self.pending_save_count = 0
 
@@ -208,6 +378,8 @@ class AIFArtistWidget(QWidget):
         self._curve_timer.setSingleShot(True)
         self._curve_timer.timeout.connect(self._refresh_curve)
         self.viewer._aifartist_widget = self
+        if aifartist_right_click_erase not in self.viewer.mouse_drag_callbacks:
+            self.viewer.mouse_drag_callbacks.insert(0, aifartist_right_click_erase)
         self.viewer.mouse_wheel_callbacks.clear()
         self.viewer.mouse_wheel_callbacks.append(aifartist_mouse_wheel)
         self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
@@ -291,6 +463,24 @@ class AIFArtistWidget(QWidget):
 
         self.curve_canvas = CurveCanvas()
         layout.addWidget(self.curve_canvas)
+        self.show_first_normalized_checkbox = QCheckBox("Show normalized-to-first-point graph")
+        self.show_first_normalized_checkbox.toggled.connect(self._update_curve_visibility)
+        layout.addWidget(self.show_first_normalized_checkbox)
+        self.first_normalized_curve_canvas = CurveCanvas(
+            title="ROI Signal Intensity (Normalized to First Point)",
+            y_label="Relative intensity",
+        )
+        self.first_normalized_curve_canvas.setVisible(False)
+        layout.addWidget(self.first_normalized_curve_canvas)
+        self.show_second_normalized_checkbox = QCheckBox("Show normalized-to-second-point graph")
+        self.show_second_normalized_checkbox.toggled.connect(self._update_curve_visibility)
+        layout.addWidget(self.show_second_normalized_checkbox)
+        self.second_normalized_curve_canvas = CurveCanvas(
+            title="ROI Signal Intensity (Normalized to Second Point)",
+            y_label="Relative intensity",
+        )
+        self.second_normalized_curve_canvas.setVisible(False)
+        layout.addWidget(self.second_normalized_curve_canvas)
 
         button_row = QHBoxLayout()
         self.prev_button = QPushButton("Previous")
@@ -299,9 +489,12 @@ class AIFArtistWidget(QWidget):
         self.clear_button.clicked.connect(self.clear_roi)
         self.skip_button = QPushButton("Skip")
         self.skip_button.clicked.connect(self.load_next)
+        self.flag_button = QPushButton("Flag and Skip")
+        self.flag_button.clicked.connect(self.flag_current_and_advance)
         button_row.addWidget(self.prev_button)
         button_row.addWidget(self.clear_button)
         button_row.addWidget(self.skip_button)
+        button_row.addWidget(self.flag_button)
         layout.addLayout(button_row)
 
         self.save_button = QPushButton("Save ROI and Next")
@@ -374,6 +567,253 @@ class AIFArtistWidget(QWidget):
 
     def _set_status(self, message: str) -> None:
         self.status_label.setText(message)
+
+    def _clear_prefetch_state(self) -> None:
+        self._prefetch_request_id += 1
+        self._prefetched_index = None
+        self._prefetched_record = None
+
+    def _set_record_loading_state(self, is_loading: bool) -> None:
+        self._record_load_in_progress = is_loading
+        for widget in (
+            self.prev_button,
+            self.clear_button,
+            self.skip_button,
+            self.flag_button,
+            self.save_button,
+            self.frame_slider,
+            self.frame_spinbox,
+        ):
+            widget.setEnabled(not is_loading)
+        if self.labels_layer is not None:
+            self.labels_layer.editable = not is_loading
+            if is_loading:
+                self.labels_layer.mode = "pan_zoom"
+            else:
+                self._sync_roi_interaction_mode()
+
+    def _update_curve_visibility(self) -> None:
+        self.first_normalized_curve_canvas.setVisible(self.show_first_normalized_checkbox.isChecked())
+        self.second_normalized_curve_canvas.setVisible(self.show_second_normalized_checkbox.isChecked())
+
+    def _clear_loaded_record_state(self, message: str) -> None:
+        self._set_record_loading_state(False)
+        self._clear_prefetch_state()
+        self.current_index = 0
+        self.current_record = None
+        self.current_image = None
+        self.current_data = None
+        self.current_curve = None
+        self.position_label.setText("0 / 0")
+        self.file_label.setText("-")
+        self.roi_summary_label.setText("0 voxels")
+        self.curve_canvas.update_curve(None)
+        self.first_normalized_curve_canvas.update_curve(None)
+        self.second_normalized_curve_canvas.update_curve(None)
+        self.frame_slider.blockSignals(True)
+        self.frame_spinbox.blockSignals(True)
+        self.frame_slider.setMaximum(0)
+        self.frame_spinbox.setMaximum(0)
+        self.frame_slider.setValue(0)
+        self.frame_spinbox.setValue(0)
+        self.frame_slider.blockSignals(False)
+        self.frame_spinbox.blockSignals(False)
+        if self.image_layer is not None:
+            self.image_layer.visible = False
+        if self.labels_layer is not None:
+            self.labels_layer.data = np.zeros_like(self.labels_layer.data, dtype=np.uint8)
+            self.labels_layer.visible = False
+        self._set_status(message)
+
+    def _apply_loaded_record(self, index: int, loaded_record: LoadedRecord) -> None:
+        self._clear_prefetch_state()
+        self.current_index = min(max(index, 0), len(self.records) - 1)
+        record = loaded_record.record
+        data = loaded_record.data
+        self.current_record = record
+        self.current_image = loaded_record.source_image
+        self.current_data = data
+        self.current_curve = None
+        self.current_2d_order = DEFAULT_2D_ORDER
+        self.current_2d_slice_indices = {axis: data.shape[axis] // 2 for axis in range(3)}
+        self.has_entered_2d_view = False
+        self.current_spacing = loaded_record.spacing
+        self.current_intensity_bounds = loaded_record.intensity_bounds
+        self.current_ornt_source_to_display = loaded_record.source_to_display
+        self.current_ornt_display_to_source = loaded_record.display_to_source
+
+        frame_count = data.shape[-1]
+        default_frame = loaded_record.default_frame
+        auto_limits = compute_auto_contrast_limits(
+            data[..., default_frame],
+            self.current_intensity_bounds,
+        )
+        preserved_limits = auto_limits
+        if self.image_layer is not None:
+            current_limits = tuple(float(value) for value in self.image_layer.contrast_limits)
+            if len(current_limits) == 2 and np.all(np.isfinite(current_limits)) and current_limits[0] < current_limits[1]:
+                preserved_limits = current_limits
+        self.frame_slider.blockSignals(True)
+        self.frame_spinbox.blockSignals(True)
+        self.frame_slider.setMaximum(frame_count - 1)
+        self.frame_spinbox.setMaximum(frame_count - 1)
+        self.frame_slider.setValue(default_frame)
+        self.frame_spinbox.setValue(default_frame)
+        self.frame_slider.blockSignals(False)
+        self.frame_spinbox.blockSignals(False)
+
+        if self.image_layer is None:
+            self.image_layer = self.viewer.add_image(
+                data[..., default_frame],
+                name="Dynamic 3D volume",
+                colormap="gray",
+                rendering="mip",
+                depiction="volume",
+                scale=self.current_spacing,
+                contrast_limits=preserved_limits,
+            )
+        else:
+            self.image_layer.data = data[..., default_frame]
+            self.image_layer.scale = self.current_spacing
+            self.image_layer.contrast_limits = preserved_limits
+        self.image_layer.visible = True
+
+        control_bounds = (
+            min(self.current_intensity_bounds[0], preserved_limits[0]),
+            max(self.current_intensity_bounds[1], preserved_limits[1]),
+        )
+        self._configure_window_level_controls(control_bounds)
+        self._set_window_level_controls(*preserved_limits)
+
+        if self.labels_layer is None:
+            self.labels_layer = self.viewer.add_labels(
+                np.zeros(data.shape[:3], dtype=np.uint8),
+                name="AIF ROI",
+                scale=self.current_spacing,
+            )
+            self.labels_layer.opacity = 0.55
+            self.labels_layer.brush_size = 3
+            self.labels_layer.n_edit_dimensions = 2
+            self.labels_layer.selected_label = 1
+            self._bind_label_events()
+        else:
+            self.labels_layer.data = np.zeros(data.shape[:3], dtype=np.uint8)
+            self.labels_layer.scale = self.current_spacing
+            self.labels_layer.brush_size = 3
+            self.labels_layer.n_edit_dimensions = 2
+            self.labels_layer.selected_label = 1
+        if loaded_record.existing_mask is not None:
+            self.labels_layer.data = np.asarray(loaded_record.existing_mask, dtype=np.uint8)
+        self.labels_layer.visible = True
+
+        self.viewer.dims.ndisplay = 3
+        self._apply_default_view(reset_camera=True)
+        self.position_label.setText(f"{self.current_index + 1} / {len(self.records)}")
+        self.file_label.setText(str(record.image_path))
+        self._set_status(
+            f"Loaded frame {default_frame} with the largest increase in average signal intensity, "
+            "coronal view, and voxel spacing "
+            f"{self.current_spacing[0]:.2f} x {self.current_spacing[1]:.2f} x {self.current_spacing[2]:.2f} mm."
+        )
+        self._refresh_curve()
+        self._request_prefetch(self.current_index + 1)
+
+    def _request_prefetch(self, index: int) -> None:
+        if not self.records or index < 0 or index >= len(self.records):
+            self._clear_prefetch_state()
+            return
+        if self._prefetched_index == index and self._prefetched_record is not None:
+            return
+
+        self._prefetch_request_id += 1
+        request_id = self._prefetch_request_id
+        self._prefetched_index = None
+        self._prefetched_record = None
+
+        task = LoadTask(
+            request_id,
+            index,
+            self.records[index],
+            self.output_root,
+            self.rater_name,
+        )
+        task.signals.finished.connect(self._on_prefetch_loaded)
+        task.signals.failed.connect(self._on_prefetch_failed)
+        self.save_thread_pool.start(task)
+
+    def _on_prefetch_loaded(
+        self,
+        request_id: int,
+        index: int,
+        loaded_record: LoadedRecord,
+    ) -> None:
+        if request_id != self._prefetch_request_id:
+            return
+        self._prefetched_index = index
+        self._prefetched_record = loaded_record
+
+    def _on_prefetch_failed(
+        self,
+        request_id: int,
+        index: int,
+        record_name: str,
+        error_message: str,
+    ) -> None:
+        if request_id != self._prefetch_request_id:
+            return
+        self._prefetched_index = None
+        self._prefetched_record = None
+
+    def _request_background_record_load(self, index: int, status_message: str) -> None:
+        if not self.records:
+            self._clear_loaded_record_state("No input images found.")
+            return
+
+        target_index = min(max(index, 0), len(self.records) - 1)
+        if self._prefetched_index == target_index and self._prefetched_record is not None:
+            self._apply_loaded_record(target_index, self._prefetched_record)
+            self._set_record_loading_state(False)
+            self._set_status(status_message)
+            return
+
+        self._record_load_request_id += 1
+        request_id = self._record_load_request_id
+        self._set_record_loading_state(True)
+        self._set_status(status_message)
+
+        task = LoadTask(
+            request_id,
+            target_index,
+            self.records[target_index],
+            self.output_root,
+            self.rater_name,
+        )
+        task.signals.finished.connect(self._on_background_record_loaded)
+        task.signals.failed.connect(self._on_background_record_failed)
+        self.save_thread_pool.start(task)
+
+    def _on_background_record_loaded(
+        self,
+        request_id: int,
+        index: int,
+        loaded_record: LoadedRecord,
+    ) -> None:
+        if request_id != self._record_load_request_id:
+            return
+        self._apply_loaded_record(index, loaded_record)
+        self._set_record_loading_state(False)
+
+    def _on_background_record_failed(
+        self,
+        request_id: int,
+        index: int,
+        record_name: str,
+        error_message: str,
+    ) -> None:
+        if request_id != self._record_load_request_id:
+            return
+        self._set_record_loading_state(False)
+        self._show_error(f"Failed to load {record_name}: {error_message}")
 
     def step_frame_from_scroll(self, signed_delta: float) -> None:
         if self.current_data is None:
@@ -547,7 +987,7 @@ class AIFArtistWidget(QWidget):
         self.viewer.camera.mouse_zoom = True
         if reset_camera:
             self.viewer.reset_view()
-            self.viewer.camera.angles = (0, -90, 90)
+            self.viewer.camera.set_view_direction((0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         self._sync_roi_interaction_mode()
 
     def _sync_roi_interaction_mode(self) -> None:
@@ -556,7 +996,6 @@ class AIFArtistWidget(QWidget):
 
         self.labels_layer.editable = True
         self.labels_layer.visible = True
-        self.labels_layer.selected_label = 1
         self.viewer.layers.selection.active = self.labels_layer
         if self.viewer.dims.ndisplay == 2:
             self.labels_layer.mode = "paint"
@@ -565,112 +1004,23 @@ class AIFArtistWidget(QWidget):
 
     def load_record(self, index: int) -> None:
         if not self.records:
-            self._set_status("No input images found.")
+            self._clear_loaded_record_state("No input images found.")
             return
 
-        self.current_index = min(max(index, 0), len(self.records) - 1)
-        record = self.records[self.current_index]
+        self._record_load_request_id += 1
+        self._set_record_loading_state(False)
+        target_index = min(max(index, 0), len(self.records) - 1)
+        if self._prefetched_index == target_index and self._prefetched_record is not None:
+            self._apply_loaded_record(target_index, self._prefetched_record)
+            return
+
+        record = self.records[target_index]
         try:
-            source_nifti = nib.load(str(record.image_path))
-            display_nifti = nib.as_closest_canonical(source_nifti)
-            data = np.asarray(display_nifti.get_fdata(dtype=np.float32), dtype=np.float32)
+            loaded_record = prepare_record_for_display(record, self.output_root, self.rater_name)
         except Exception as exc:
             self._show_error(f"Failed to load {record.image_path.name}: {exc}")
             return
-
-        if data.ndim != 4:
-            self._show_error(
-                f"Expected 4D image for {record.image_path.name}, got shape {data.shape}."
-            )
-            return
-
-        self.current_record = record
-        self.current_image = source_nifti
-        self.current_data = data
-        self.current_curve = None
-        self.current_2d_order = DEFAULT_2D_ORDER
-        self.current_2d_slice_indices = {
-            axis: data.shape[axis] // 2 for axis in range(3)
-        }
-        self.has_entered_2d_view = False
-        self.current_spacing = extract_spatial_scale(display_nifti)
-        self.current_intensity_bounds = compute_intensity_bounds(data)
-        source_ornt = io_orientation(source_nifti.affine)
-        display_ornt = io_orientation(display_nifti.affine)
-        self.current_ornt_source_to_display = ornt_transform(source_ornt, display_ornt)
-        self.current_ornt_display_to_source = ornt_transform(display_ornt, source_ornt)
-
-        frame_count = data.shape[-1]
-        default_frame = infer_max_increase_frame(data)
-        auto_limits = compute_auto_contrast_limits(
-            data[..., default_frame],
-            self.current_intensity_bounds,
-        )
-        preserved_limits = auto_limits
-        if self.image_layer is not None:
-            current_limits = tuple(float(value) for value in self.image_layer.contrast_limits)
-            if len(current_limits) == 2 and np.all(np.isfinite(current_limits)) and current_limits[0] < current_limits[1]:
-                preserved_limits = current_limits
-        self.frame_slider.blockSignals(True)
-        self.frame_spinbox.blockSignals(True)
-        self.frame_slider.setMaximum(frame_count - 1)
-        self.frame_spinbox.setMaximum(frame_count - 1)
-        self.frame_slider.setValue(default_frame)
-        self.frame_spinbox.setValue(default_frame)
-        self.frame_slider.blockSignals(False)
-        self.frame_spinbox.blockSignals(False)
-
-        if self.image_layer is None:
-            self.image_layer = self.viewer.add_image(
-                data[..., default_frame],
-                name="Dynamic 3D volume",
-                colormap="gray",
-                rendering="mip",
-                depiction="volume",
-                scale=self.current_spacing,
-                contrast_limits=preserved_limits,
-            )
-        else:
-            self.image_layer.data = data[..., default_frame]
-            self.image_layer.scale = self.current_spacing
-            self.image_layer.contrast_limits = preserved_limits
-
-        control_bounds = (
-            min(self.current_intensity_bounds[0], preserved_limits[0]),
-            max(self.current_intensity_bounds[1], preserved_limits[1]),
-        )
-        self._configure_window_level_controls(control_bounds)
-        self._set_window_level_controls(*preserved_limits)
-
-        if self.labels_layer is None:
-            self.labels_layer = self.viewer.add_labels(
-                np.zeros(data.shape[:3], dtype=np.uint8),
-                name="AIF ROI",
-                scale=self.current_spacing,
-            )
-            self.labels_layer.opacity = 0.55
-            self.labels_layer.brush_size = 3
-            self.labels_layer.n_edit_dimensions = 2
-            self.labels_layer.selected_label = 1
-            self._bind_label_events()
-        else:
-            self.labels_layer.data = np.zeros(data.shape[:3], dtype=np.uint8)
-            self.labels_layer.scale = self.current_spacing
-            self.labels_layer.brush_size = 3
-            self.labels_layer.n_edit_dimensions = 2
-            self.labels_layer.selected_label = 1
-
-        self._load_existing_mask()
-        self.viewer.dims.ndisplay = 3
-        self._apply_default_view(reset_camera=True)
-        self.position_label.setText(f"{self.current_index + 1} / {len(self.records)}")
-        self.file_label.setText(str(record.image_path))
-        self._set_status(
-            f"Loaded frame {default_frame} with the largest increase in average signal intensity, "
-            "coronal view, and voxel spacing "
-            f"{self.current_spacing[0]:.2f} x {self.current_spacing[1]:.2f} x {self.current_spacing[2]:.2f} mm."
-        )
-        self._refresh_curve()
+        self._apply_loaded_record(target_index, loaded_record)
 
     def _load_existing_mask(self) -> None:
         if self.labels_layer is None or self.current_record is None:
@@ -694,26 +1044,53 @@ class AIFArtistWidget(QWidget):
                 f"Existing ROI shape {mask.shape} does not match image shape {self.current_data.shape[:3]}."
             )
             return
-        self.labels_layer.data = (mask > 0).astype(np.uint8)
+        self.labels_layer.data = np.asarray(mask, dtype=np.uint8)
         self._set_status("Loaded existing ROI for this rater.")
 
     def _refresh_curve(self) -> None:
         if self.current_data is None or self.labels_layer is None:
             self.curve_canvas.update_curve(None)
+            self.first_normalized_curve_canvas.update_curve(None)
+            self.second_normalized_curve_canvas.update_curve(None)
             self.roi_summary_label.setText("0 voxels")
             return
 
-        mask = np.asarray(self.labels_layer.data > 0)
+        label_data = np.asarray(self.labels_layer.data)
+        mask = np.asarray(label_data > 0)
         voxel_count = int(mask.sum())
         self.roi_summary_label.setText(f"{voxel_count} voxels")
         if voxel_count == 0:
             self.current_curve = None
             self.curve_canvas.update_curve(None)
+            self.first_normalized_curve_canvas.update_curve(None)
+            self.second_normalized_curve_canvas.update_curve(None)
             return
 
         roi_matrix = self.current_data[mask]
         self.current_curve = roi_matrix.mean(axis=0)
-        self.curve_canvas.update_curve(self.current_curve)
+        label_curves: dict[int, np.ndarray] = {}
+        label_curve_colors: dict[int, tuple[float, float, float, float]] = {}
+        for label_value in sorted(int(value) for value in np.unique(label_data) if value > 0):
+            label_mask = label_data == label_value
+            if not np.any(label_mask):
+                continue
+            label_curves[label_value] = self.current_data[label_mask].mean(axis=0)
+            label_color = self.labels_layer.get_color(label_value)
+            if label_color is not None:
+                label_curve_colors[label_value] = tuple(float(channel) for channel in label_color)
+        self.curve_canvas.update_curve(label_curves, label_curve_colors)
+        first_point_curves = normalize_curves_to_point(label_curves, 0)
+        second_point_curves = normalize_curves_to_point(label_curves, 1)
+        self.first_normalized_curve_canvas.update_curve(
+            first_point_curves,
+            label_curve_colors,
+            empty_message="Normalization to the first point is unavailable for the current labels.",
+        )
+        self.second_normalized_curve_canvas.update_curve(
+            second_point_curves,
+            label_curve_colors,
+            empty_message="Normalization to the second point is unavailable for the current labels.",
+        )
 
     def clear_roi(self) -> None:
         if self.labels_layer is None:
@@ -733,6 +1110,39 @@ class AIFArtistWidget(QWidget):
             self._set_status("Reached the last image.")
             return
         self.load_record(self.current_index + 1)
+
+    def flag_current_and_advance(self) -> None:
+        if self.current_record is None:
+            return
+
+        reason, accepted = QInputDialog.getItem(
+            self,
+            "Flag image",
+            "Reason for flagging:",
+            list(FLAG_REASON_OPTIONS),
+            0,
+            False,
+        )
+        if not accepted or not reason:
+            return
+
+        try:
+            append_flagged_record(self.output_root, self.current_record, self.rater_name, reason)
+        except Exception as exc:
+            self._show_error(f"Failed to record image flag: {exc}")
+            return
+
+        flagged_name = self.current_record.image_path.name
+        self.records.pop(self.current_index)
+        if not self.records:
+            self._clear_loaded_record_state(
+                f"Flagged {flagged_name} as '{reason}'. No remaining images in the queue."
+            )
+            return
+
+        next_index = min(self.current_index, len(self.records) - 1)
+        self.load_record(next_index)
+        self._set_status(f"Flagged {flagged_name} as '{reason}' and skipped it.")
 
     def save_current_and_advance(self) -> None:
         if self.current_record is None or self.current_image is None or self.labels_layer is None:
@@ -768,15 +1178,24 @@ class AIFArtistWidget(QWidget):
             mask_path=mask_path,
             tsv_path=tsv_path,
             json_path=json_path,
+            write_sidecars=self.write_sidecars,
         )
         self._queue_background_save(save_request)
 
         if self.current_index < len(self.records) - 1:
-            self.load_record(self.current_index + 1)
-            self._set_status(
-                f"Queued background save for {save_request.record_stem}. "
-                f"Pending saves: {self.pending_save_count}."
-            )
+            next_index = self.current_index + 1
+            if self._prefetched_index == next_index and self._prefetched_record is not None:
+                self._apply_loaded_record(next_index, self._prefetched_record)
+                self._set_status(
+                    f"Queued background save for {save_request.record_stem}. "
+                    f"Showing next image immediately. Pending saves: {self.pending_save_count}."
+                )
+            else:
+                self._request_background_record_load(
+                    next_index,
+                    f"Queued background save for {save_request.record_stem}. Loading next image... "
+                    f"Pending saves: {self.pending_save_count}.",
+                )
         else:
             self._set_status(
                 f"Queued final ROI save in background. Pending saves: {self.pending_save_count}."
@@ -791,7 +1210,7 @@ class AIFArtistWidget(QWidget):
 
     def _on_background_save_finished(self, record_stem: str) -> None:
         self.pending_save_count = max(self.pending_save_count - 1, 0)
-        if self.pending_save_count == 0:
+        if self.pending_save_count == 0 and not self._record_load_in_progress:
             self._set_status("Background ROI saves complete.")
 
     def _on_background_save_failed(self, record_stem: str, error_message: str) -> None:
@@ -879,6 +1298,21 @@ def compute_window_control_range(bounds: tuple[float, float]) -> tuple[float, fl
     return (lower_bound - padding, upper_bound + padding)
 
 
+def normalize_curves_to_point(
+    curves: dict[int, np.ndarray],
+    point_index: int,
+) -> dict[int, np.ndarray]:
+    normalized_curves: dict[int, np.ndarray] = {}
+    for label_value, curve in curves.items():
+        if curve.size <= point_index:
+            continue
+        baseline_value = float(curve[point_index])
+        if not np.isfinite(baseline_value) or baseline_value == 0.0:
+            continue
+        normalized_curves[label_value] = np.asarray(curve / baseline_value, dtype=np.float32)
+    return normalized_curves
+
+
 def write_aif_outputs(request: SaveRequest) -> None:
     request.mask_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -887,6 +1321,9 @@ def write_aif_outputs(request: SaveRequest) -> None:
     mask_header.set_data_shape(request.mask.shape)
     mask_image = nib.Nifti1Image(request.mask, affine=request.affine, header=mask_header)
     nib.save(mask_image, str(request.mask_path))
+
+    if not request.write_sidecars:
+        return
 
     curve_table = pd.DataFrame(
         {
@@ -1000,6 +1437,36 @@ def mask_path_for_record(output_root: Path, record: ImageRecord, rater_name: str
     return output_directory_for(output_root, record) / f"{output_stem_for(record, rater_name)}_mask.nii.gz"
 
 
+def flagged_csv_path_for(output_root: Path, rater_name: str) -> Path:
+    return output_root / f"desc-rater{sanitize_label(rater_name)}_flags.csv"
+
+
+def load_flagged_image_paths(output_root: Path, rater_name: str) -> set[str]:
+    csv_path = flagged_csv_path_for(output_root, rater_name)
+    if not csv_path.exists():
+        return set()
+
+    flagged_images: set[str] = set()
+    with csv_path.open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            image_path = (row.get("img") or "").strip()
+            if image_path:
+                flagged_images.add(image_path)
+    return flagged_images
+
+
+def append_flagged_record(output_root: Path, record: ImageRecord, rater_name: str, reason: str) -> None:
+    csv_path = flagged_csv_path_for(output_root, rater_name)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=("img", "reason"))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({"img": str(record.image_path), "reason": reason})
+
+
 def mask_path_variants_for_record(output_root: Path, record: ImageRecord, rater_name: str) -> tuple[Path, ...]:
     output_directory = output_directory_for(output_root, record)
     sanitized_rater = sanitize_label(rater_name)
@@ -1023,12 +1490,14 @@ def filter_completed_records(
     rater_name: str,
     include_completed: bool,
 ) -> list[ImageRecord]:
+    flagged_images = load_flagged_image_paths(output_root, rater_name)
     if include_completed:
-        return list(records)
+        return [record for record in records if str(record.image_path) not in flagged_images]
     return [
         record
         for record in records
-        if not existing_mask_path_for_record(output_root, record, rater_name).exists()
+        if str(record.image_path) not in flagged_images
+        and not existing_mask_path_for_record(output_root, record, rater_name).exists()
     ]
 
 
@@ -1111,14 +1580,7 @@ def is_valid_source_image(path: Path) -> bool:
 def infer_output_root(records: Sequence[ImageRecord], requested_output_root: str | None) -> Path:
     if requested_output_root:
         return Path(requested_output_root).expanduser().resolve()
-    if not records:
-        return Path.cwd() / "derivatives" / "aifartist"
-
-    first_path = records[0].image_path
-    for candidate in (first_path, *first_path.parents):
-        if candidate.is_dir() and (candidate / "dataset_description.json").exists():
-            return candidate / "derivatives" / "aifartist"
-    return first_path.parent / "derivatives" / "aifartist"
+    return DEFAULT_OUTPUT_ROOT
 
 
 def ask_for_rater_name(initial_value: str | None = None) -> str:
@@ -1165,6 +1627,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include images that already have an AIF ROI saved by the current rater.",
     )
+    parser.add_argument(
+        "--write-sidecars",
+        action="store_true",
+        help="Also write the ROI timeseries TSV and metadata JSON alongside the mask.",
+    )
     return parser
 
 
@@ -1184,9 +1651,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = filter_completed_records(records, output_root, rater_name, args.include_completed)
     if not records:
         if args.include_completed:
-            parser.error("No 4D desc-hmc_DCE.nii[.gz] files found in the provided inputs.")
+            parser.error(
+                "No remaining 4D desc-hmc_DCE.nii[.gz] files for this rater after excluding flagged images."
+            )
         parser.error(
-            "No remaining 4D desc-hmc_DCE.nii[.gz] files for this rater. Use --include-completed to reopen completed AIFs."
+            "No remaining 4D desc-hmc_DCE.nii[.gz] files for this rater after excluding completed and flagged images. "
+            "Use --include-completed to reopen completed AIFs; flagged images remain excluded."
         )
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -1199,6 +1669,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rater_name=rater_name,
         start_index=args.start_index,
         include_completed=args.include_completed,
+        write_sidecars=args.write_sidecars,
     )
     viewer.window.add_dock_widget(widget, area="right", name="AIF Session")
 
