@@ -23,12 +23,14 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -179,6 +181,10 @@ class CurveCanvas(FigureCanvasQTAgg):
         self.axes.set_xlabel("Timepoint")
         self.axes.set_ylabel(self.y_label)
         self.axes.grid(True, alpha=0.3)
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.updateGeometry()
 
     def update_curve(
         self,
@@ -372,6 +378,7 @@ class AIFArtistWidget(QWidget):
         self._prefetched_record: LoadedRecord | None = None
         self.save_thread_pool = QThreadPool(self)
         self.pending_save_count = 0
+        self.setMinimumWidth(0)
 
         self._curve_timer = QTimer(self)
         self._curve_timer.setInterval(150)
@@ -395,15 +402,21 @@ class AIFArtistWidget(QWidget):
     def _build_ui(self) -> None:
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         info_group = QGroupBox("Session")
         info_layout = QFormLayout()
+        info_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.rater_edit = QLineEdit(self.rater_name)
+        self.rater_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.rater_edit.editingFinished.connect(self._on_rater_changed)
         self.position_label = QLabel("0 / 0")
         self.file_label = QLabel("-")
         self.file_label.setWordWrap(True)
+        self.file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_label = QLabel("Ready")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.roi_summary_label = QLabel("0 voxels")
         info_layout.addRow("Rater", self.rater_edit)
         info_layout.addRow("Queue", self.position_label)
@@ -417,6 +430,7 @@ class AIFArtistWidget(QWidget):
         frame_layout = QVBoxLayout()
         slider_row = QHBoxLayout()
         self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.frame_slider.setMinimum(0)
         self.frame_slider.valueChanged.connect(self._on_frame_changed)
         self.frame_spinbox = QSpinBox()
@@ -436,6 +450,7 @@ class AIFArtistWidget(QWidget):
         self.window_low_spinbox.setKeyboardTracking(False)
         self.window_low_spinbox.valueChanged.connect(self._on_window_limits_changed)
         self.window_low_slider = QSlider(Qt.Horizontal)
+        self.window_low_slider.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.window_low_slider.setRange(0, 1000)
         self.window_low_slider.valueChanged.connect(self._on_window_slider_changed)
         self.window_high_spinbox = QDoubleSpinBox()
@@ -443,6 +458,7 @@ class AIFArtistWidget(QWidget):
         self.window_high_spinbox.setKeyboardTracking(False)
         self.window_high_spinbox.valueChanged.connect(self._on_window_limits_changed)
         self.window_high_slider = QSlider(Qt.Horizontal)
+        self.window_high_slider.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.window_high_slider.setRange(0, 1000)
         self.window_high_slider.valueChanged.connect(self._on_window_slider_changed)
         self.window_auto_button = QPushButton("Auto")
@@ -463,7 +479,9 @@ class AIFArtistWidget(QWidget):
 
         self.curve_canvas = CurveCanvas()
         layout.addWidget(self.curve_canvas)
-        self.show_first_normalized_checkbox = QCheckBox("Show normalized-to-first-point graph")
+        self.show_first_normalized_checkbox = QCheckBox("Show first-point normalized graph")
+        self.show_first_normalized_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.show_first_normalized_checkbox.setToolTip("Toggle the graph normalized to the first timepoint")
         self.show_first_normalized_checkbox.toggled.connect(self._update_curve_visibility)
         layout.addWidget(self.show_first_normalized_checkbox)
         self.first_normalized_curve_canvas = CurveCanvas(
@@ -472,7 +490,9 @@ class AIFArtistWidget(QWidget):
         )
         self.first_normalized_curve_canvas.setVisible(False)
         layout.addWidget(self.first_normalized_curve_canvas)
-        self.show_second_normalized_checkbox = QCheckBox("Show normalized-to-second-point graph")
+        self.show_second_normalized_checkbox = QCheckBox("Show second-point normalized graph")
+        self.show_second_normalized_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.show_second_normalized_checkbox.setToolTip("Toggle the graph normalized to the second timepoint")
         self.show_second_normalized_checkbox.toggled.connect(self._update_curve_visibility)
         layout.addWidget(self.show_second_normalized_checkbox)
         self.second_normalized_curve_canvas = CurveCanvas(
@@ -482,22 +502,31 @@ class AIFArtistWidget(QWidget):
         self.second_normalized_curve_canvas.setVisible(False)
         layout.addWidget(self.second_normalized_curve_canvas)
 
-        button_row = QHBoxLayout()
+        button_row = QGridLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setHorizontalSpacing(6)
+        button_row.setVerticalSpacing(6)
         self.prev_button = QPushButton("Previous")
+        self.prev_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.prev_button.clicked.connect(self.load_previous)
         self.clear_button = QPushButton("Clear ROI")
+        self.clear_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.clear_button.clicked.connect(self.clear_roi)
         self.skip_button = QPushButton("Skip")
+        self.skip_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.skip_button.clicked.connect(self.load_next)
-        self.flag_button = QPushButton("Flag and Skip")
+        self.flag_button = QPushButton("Flag + Skip")
+        self.flag_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.flag_button.clicked.connect(self.flag_current_and_advance)
-        button_row.addWidget(self.prev_button)
-        button_row.addWidget(self.clear_button)
-        button_row.addWidget(self.skip_button)
-        button_row.addWidget(self.flag_button)
+        self.flag_button.setToolTip("Flag the current image and move to the next one")
+        button_row.addWidget(self.prev_button, 0, 0)
+        button_row.addWidget(self.clear_button, 0, 1)
+        button_row.addWidget(self.skip_button, 1, 0)
+        button_row.addWidget(self.flag_button, 1, 1)
         layout.addLayout(button_row)
 
-        self.save_button = QPushButton("Save ROI and Next")
+        self.save_button = QPushButton("Save ROI + Next")
+        self.save_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.save_button.clicked.connect(self.save_current_and_advance)
         self.save_button.setShortcut("Ctrl+Return")
         self.save_button.setToolTip(
@@ -1671,7 +1700,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_completed=args.include_completed,
         write_sidecars=args.write_sidecars,
     )
-    viewer.window.add_dock_widget(widget, area="right", name="AIF Session")
+    dock_widget = viewer.window.add_dock_widget(
+        widget,
+        area="right",
+        name="AIF Session",
+        menu=viewer.window.window_menu,
+    )
+    dock_widget.setMinimumWidth(0)
 
     napari.run()
     return 0
