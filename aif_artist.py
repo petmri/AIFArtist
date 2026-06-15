@@ -1668,6 +1668,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    app = QApplication.instance() or QApplication(sys.argv)
+
     if not args.inputs and not args.manifest:
         parser.error("Provide at least one input path or a manifest.")
 
@@ -1687,8 +1689,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "No remaining 4D desc-hmc_DCE.nii[.gz] files for this rater after excluding completed and flagged images. "
             "Use --include-completed to reopen completed AIFs; flagged images remain excluded."
         )
-
-    app = QApplication.instance() or QApplication(sys.argv)
 
     viewer = napari.Viewer(title="AIFArtist")
     widget = AIFArtistWidget(

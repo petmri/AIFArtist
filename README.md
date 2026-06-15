@@ -15,6 +15,17 @@ AIFArtist is a napari desktop app for manual arterial input function annotation 
 Use the existing virtual environment or create a new one, then install the dependencies:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+On Windows PowerShell, activate it with:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+```bash
 pip install -r requirements.txt
 ```
 

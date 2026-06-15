@@ -1,6 +1,7 @@
+matplotlib
 napari
 nibabel
 numpy
 pandas
-matplotlib
 PySide6
+qtpy
