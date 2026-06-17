@@ -38,6 +38,8 @@ from qtpy.QtWidgets import (
     QInputDialog,
 )
 
+from utils import quality_ultimate
+
 
 SOURCE_IMAGE_SUFFIXES = ("desc-hmc_DCE.nii", "desc-hmc_DCE.nii.gz")
 MASK_LABEL_VARIANTS = ("AIF", "aif")
@@ -190,6 +192,7 @@ class CurveCanvas(FigureCanvasQTAgg):
         self,
         curves: dict[int, np.ndarray] | None,
         curve_colors: dict[int, tuple[float, float, float, float]] | None = None,
+        curve_labels: dict[int, str] | None = None,
         empty_message: str = "Paint an AIF ROI to preview the mean time curve.",
     ) -> None:
         self.axes.clear()
@@ -209,17 +212,21 @@ class CurveCanvas(FigureCanvasQTAgg):
         else:
             for label_value, curve in sorted(curves.items()):
                 color = None if curve_colors is None else curve_colors.get(label_value)
+                label_text = (
+                    f"Label {label_value}"
+                    if curve_labels is None
+                    else curve_labels.get(label_value, f"Label {label_value}")
+                )
                 timepoints = np.arange(curve.size)
                 self.axes.plot(
                     timepoints,
                     curve,
                     linewidth=2,
                     color=color,
-                    label=f"Label {label_value}",
+                    label=label_text,
                 )
                 self.axes.scatter(timepoints, curve, s=18, color=color)
-            if len(curves) > 1:
-                self.axes.legend(loc="best")
+            self.axes.legend(loc="best")
         self.draw_idle()
 
 
@@ -1099,25 +1106,30 @@ class AIFArtistWidget(QWidget):
         self.current_curve = roi_matrix.mean(axis=0)
         label_curves: dict[int, np.ndarray] = {}
         label_curve_colors: dict[int, tuple[float, float, float, float]] = {}
+        label_curve_labels: dict[int, str] = {}
         for label_value in sorted(int(value) for value in np.unique(label_data) if value > 0):
             label_mask = label_data == label_value
             if not np.any(label_mask):
                 continue
             label_curves[label_value] = self.current_data[label_mask].mean(axis=0)
+            label_quality = float(quality_ultimate(label_curves[label_value]))
+            label_curve_labels[label_value] = f"Label {label_value} (AIFitness {label_quality:.1f})"
             label_color = self.labels_layer.get_color(label_value)
             if label_color is not None:
                 label_curve_colors[label_value] = tuple(float(channel) for channel in label_color)
-        self.curve_canvas.update_curve(label_curves, label_curve_colors)
+        self.curve_canvas.update_curve(label_curves, label_curve_colors, label_curve_labels)
         first_point_curves = normalize_curves_to_point(label_curves, 0)
         second_point_curves = normalize_curves_to_point(label_curves, 1)
         self.first_normalized_curve_canvas.update_curve(
             first_point_curves,
             label_curve_colors,
+            label_curve_labels,
             empty_message="Normalization to the first point is unavailable for the current labels.",
         )
         self.second_normalized_curve_canvas.update_curve(
             second_point_curves,
             label_curve_colors,
+            label_curve_labels,
             empty_message="Normalization to the second point is unavailable for the current labels.",
         )
 
