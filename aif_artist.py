@@ -45,7 +45,7 @@ SOURCE_IMAGE_SUFFIXES = ("desc-hmc_DCE.nii", "desc-hmc_DCE.nii.gz")
 MASK_LABEL_VARIANTS = ("AIF", "aif")
 FLAG_REASON_OPTIONS = ("Poor AIF", "Missing baseline")
 DEFAULT_2D_ORDER = (1, 2, 0)
-DEFAULT_OUTPUT_ROOT = Path("/media/network_mriphysics/dce_bids/derivatives/AIFArtist")
+DEFAULT_OUTPUT_ROOT = Path("./derivatives/AIFArtist")
 
 
 def normalize_2d_order(order: Sequence[int]) -> tuple[int, int, int]:

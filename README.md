@@ -51,11 +51,11 @@ By default, the queue skips images that already have a saved ROI for the current
 python aif_artist.py /path/to/bids_dataset --rater AB --include-completed
 ```
 
-By default, outputs are written to `/media/network_mriphysics/dce_bids/derivatives`. Use `--output-root` to override that location, or `--write-sidecars` if you also want the ROI timeseries TSV and metadata JSON files.
+By default, outputs are written to `./derivatives/AIFArtist`. Use `--output-root` to override that location, or `--write-sidecars` if you also want the ROI timeseries TSV and metadata JSON files.
 
 ## Outputs
 
-By default, outputs are written under `/media/network_mriphysics/dce_bids/derivatives`. For each annotated image, the tool writes:
+By default, outputs are written under `./derivatives/AIFArtist`. For each annotated image, the tool writes:
 
 - `*_desc-raterXX_label-AIF_mask.nii.gz`: saved 3D ROI mask.
 - `desc-raterXX_flags.csv`: per-rater flag log with `img` and `reason` columns for skipped poor-AIF or missing-baseline cases.
