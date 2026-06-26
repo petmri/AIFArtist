@@ -2,6 +2,8 @@
 
 AIFArtist is a napari desktop app for manual arterial input function annotation on 4D MRI NIfTI data. It is designed for high-volume review sessions where multiple raters need to draw a 3D ROI, inspect the mean signal-intensity curve over time, save a BIDS-style derivative, and move directly to the next image.
 
+![AIFArtist screenshot](screenshot.png)
+
 ## Features
 
 - Load one or more BIDS-compliant 4D `desc-hmc_DCE.nii` or `desc-hmc_DCE.nii.gz` files, a directory tree, or a manifest file.
@@ -36,8 +38,9 @@ Launch against one or more files or folders:
 ```bash
 python aif_artist.py /path/to/bids_dataset --rater AB
 ```
+This assumes you have a BIDS-compliant 4D `desc-hmc_DCE.nii` or `desc-hmc_DCE.nii.gz` file, or a BIDS directory tree containing such files. The `--rater` argument is required to identify the current rater, and it will be embedded in the output filenames. If using DCEPrep, use `.../derivatives/DCEPrep` as the input path to load the preprocessed images.
 
-Or use a manifest:
+If your data is not BIDS-compliant, you can use a manifest:
 
 ```bash
 python aif_artist.py --manifest image_list.tsv --rater AB
@@ -79,7 +82,7 @@ The derivative root also gets a `dataset_description.json` file.
 
 ### Viewer Controls
 
-- Use napari's built-in 2D/3D view toggle to switch between slice view and volume view. The first 2D entry defaults to a coronal slice view, and the default 3D camera is coronal as well.
+- Use `Ctrl+Y` (or button in bottom left corner) to toggle between slice view and volume view. The first 2D entry defaults to a coronal slice view, and the default 3D camera is coronal as well.
 - In 2D view, plain `scroll` steps through slices.
 - In 2D or 3D view, `Ctrl+scroll` steps through time frames. Wheel up moves forward in time, and wheel down moves backward.
 - In 3D view, `Shift+scroll` adjusts the upper window limit.
